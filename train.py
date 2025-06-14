@@ -1,114 +1,82 @@
-# train.py
 import torch
 import torch.optim as optim
+import torch.nn as nn
 from tqdm import tqdm
 import os
 import time
 
-# Import các thành phần từ các file khác
 import config
 import dataset
 import models
+from torch.utils.tensorboard import SummaryWriter
 import utils
 
+
 def main():
-    print(f"[*] Sử dụng thiết bị: {config.DEVICE}")
+    dataloader, vocab_size, char_to_int, _ = dataset.load_and_preprocess_data()
+    if dataloader is None: return
+    padding_idx = 0 
 
-    # Tải dữ liệu
-    dataloader, vocab_size = dataset.load_and_preprocess_data()
-    if dataloader is None:
-        return
-
-    # Khởi tạo mô hình
-    generator = models.Generator(vocab_size).to(config.DEVICE)
-    critic = models.Critic(vocab_size).to(config.DEVICE)
-
-    # Khởi tạo optimizer
-    print(f"[*] Cài đặt LR cho Critic: {config.LEARNING_RATE}, cho Generator: {config.LEARNING_RATE * 4}")
-    optimizer_g = optim.Adam(generator.parameters(), lr=config.LEARNING_RATE * 4, betas=(0.5, 0.9))
-    optimizer_c = optim.Adam(critic.parameters(), lr=config.LEARNING_RATE, betas=(0.5, 0.9))
-
-    # Tải checkpoint nếu có
-    start_epoch, best_g_loss = utils.load_checkpoint(
+    model = models.CharRNN(vocab_size).to(config.DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    criterion = nn.CrossEntropyLoss(ignore_index=padding_idx) 
+    
+    writer = SummaryWriter(f'runs/password_model_{int(time.time())}')
+    
+    start_epoch, best_loss = utils.load_checkpoint(
         os.path.join(config.MODEL_SAVE_PATH, 'last.pt'),
-        generator, critic, optimizer_g, optimizer_c
+        model, 
+        optimizer
     )
 
-    print("\n[*] Bắt đầu huấn luyện...")
+    best_loss = float('inf')
+    print("\nStart ....")
     start_time = time.time()
-    
-    for epoch in range(start_epoch, config.EPOCHS):
+
+    for epoch in range(config.EPOCHS):
+        model.train()
+        total_loss = 0
         loop = tqdm(dataloader, leave=True)
-        total_c_loss = 0
-        total_g_loss = 0
 
-        for i, real_samples in enumerate(loop):
-            real_samples = real_samples.to(config.DEVICE)
-            batch_size = real_samples.size(0)
-
-            # --- Huấn luyện Critic ---
-            critic.train()
-            generator.eval()
-            for _ in range(config.CRITIC_LOOPS):
-                optimizer_c.zero_grad()
-                z = torch.randn(batch_size, config.LATENT_DIM, device=config.DEVICE)
-                with torch.no_grad():
-                    fake_password_int = torch.argmax(generator(z), dim=2)
-                
-                critic_real = critic(real_samples).reshape(-1)
-                critic_fake = critic(fake_password_int).reshape(-1)
-                gp = utils.gradient_penalty(critic, real_samples, fake_password_int)
-                loss_c = -(torch.mean(critic_real) - torch.mean(critic_fake)) + config.GP_WEIGHT * gp
-                loss_c.backward()
-                optimizer_c.step()
-
-            # --- Huấn luyện Generator ---
-            generator.train()
-            critic.train() # Đặt critic ở train() mode để có hàm backward
-            optimizer_g.zero_grad()
+        for inputs, targets in loop:
+            inputs, targets = inputs.to(config.DEVICE), targets.to(config.DEVICE)
             
-            z = torch.randn(batch_size, config.LATENT_DIM, device=config.DEVICE)
-            gen_fake_probs = generator(z)
+            optimizer.zero_grad()
             
-            soft_embeddings = torch.matmul(gen_fake_probs, critic.embedding.weight)
-            gen_fake_logits = critic.forward_from_embeddings(soft_embeddings).reshape(-1)
+            outputs, _ = model(inputs)
             
-            loss_g = -torch.mean(gen_fake_logits)
-            loss_g.backward()
-            optimizer_g.step()
+            # Reshape output và target để phù hợp với CrossEntropyLoss
+            # Output: (batch * seq_len, vocab_size)
+            # Target: (batch * seq_len)
+            loss = criterion(outputs.view(-1, vocab_size), targets.view(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            total_c_loss += loss_c.item()
-            total_g_loss += loss_g.item()
+            total_loss += loss.item()
             loop.set_description(f"Epoch [{epoch+1}/{config.EPOCHS}]")
-            loop.set_postfix(c_loss=loss_c.item(), g_loss=loss_g.item())
-        
-        # --- CÁC DÒNG CODE BỊ THIẾU NẰM Ở ĐÂY ---
-        # Tính toán loss trung bình cho cả epoch
-        avg_c_loss = total_c_loss / len(dataloader)
-        avg_g_loss = total_g_loss / len(dataloader)
+            loop.set_postfix(loss=loss.item())
 
-        # In ra thông tin tổng kết của epoch
-        # Dùng \r và end='' để thanh tiến trình tqdm không bị lỗi xuống dòng
-        print(f"\rEpoch [{epoch+1}/{config.EPOCHS}] - Avg Critic Loss: {avg_c_loss:.4f}, Avg Generator Loss: {avg_g_loss:.4f}")
-        # ---------------------------------------------
+        avg_loss = total_loss / len(dataloader)
+        print(f"\rEpoch [{epoch+1}/{config.EPOCHS}] - Avg Loss: {avg_loss:.4f}")
         
-        # --- Lưu Checkpoint ---
-        is_best = avg_g_loss < best_g_loss
-        best_g_loss = min(avg_g_loss, best_g_loss)
+        writer.add_scalar('Training Loss', avg_loss, epoch)
+
+        is_best = avg_loss < best_loss
+        best_loss = min(avg_loss, best_loss)
         
         state = {
             'epoch': epoch,
-            'generator_state_dict': generator.state_dict(),
-            'critic_state_dict': critic.state_dict(),
-            'optimizer_g_state_dict': optimizer_g.state_dict(),
-            'optimizer_c_state_dict': optimizer_c.state_dict(),
-            'best_g_loss': best_g_loss,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_loss': best_loss,
         }
         utils.save_checkpoint(state, is_best, config.MODEL_SAVE_PATH)
 
     end_time = time.time()
-    print(f"\n[+] Huấn luyện hoàn tất sau: {end_time - start_time:.2f} giây.")
-
+    writer.close()
+    print(f"\n[+] Complete: {end_time - start_time:.2f}s.")
 
 if __name__ == '__main__':
     main()
